@@ -1,0 +1,21 @@
+#!/bin/bash
+
+# Directory where you want to run "gleam run"
+# Use the local `gossip_algorithm` folder inside the repo
+TARGET_DIR="./gossip_algorithm_pushsum"
+
+# Directory to store outputs (changed to `output` in repo root)
+OUTPUT_DIR="./output"
+
+# Create output directory if it doesn't exist
+mkdir -p "$OUTPUT_DIR"
+
+# Loop 10 times
+for i in {1..10}
+do
+    OUTPUT_FILE="$OUTPUT_DIR/run_${i}.txt"
+    echo "Running gleam run (iteration $i)..."
+    (cd "$TARGET_DIR" && time gleam run) > "$OUTPUT_FILE" 2>&1
+done
+
+echo "Finished. All outputs saved in $OUTPUT_DIR"

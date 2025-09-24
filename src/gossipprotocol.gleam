@@ -1,5 +1,5 @@
 // project2.gleam - Enhanced Gossip Protocol with Convergence Monitoring
-import envoy
+import argv
 import gleam/bool
 import gleam/dict.{type Dict}
 import gleam/erlang/process
@@ -15,7 +15,10 @@ import gleam/string
 import gleam/time/duration.{type Duration}
 import gleam/time/timestamp
 
-// Types for our algorithms
+// =============================================================================
+// CORE TYPES AND ENUMS
+// =============================================================================
+
 pub type Algorithm {
   Gossip
   PushSum
@@ -28,7 +31,14 @@ pub type Topology {
   Imperfect3D
 }
 
-// Enhanced Gossip Message types
+pub type Position3D {
+  Position3D(x: Int, y: Int, z: Int)
+}
+
+// =============================================================================
+// GOSSIP PROTOCOL TYPES
+// =============================================================================
+
 pub type GossipMessage {
   Rumor(content: String, sender_id: Int)
   SetNeighbors(neighbors: List(process.Subject(GossipMessage)))
@@ -50,7 +60,10 @@ pub type GossipState {
   )
 }
 
-// Convergence Monitor types
+// =============================================================================
+// GOSSIP CONVERGENCE MONITOR TYPES
+// =============================================================================
+
 pub type ConvergenceMessage {
   NodeFirstHeardRumor(node_id: Int)
   NodeTerminated(node_id: Int)
@@ -85,15 +98,16 @@ pub type ConvergenceResult {
   )
 }
 
-// 3D Position type for topology building
-pub type Position3D {
-  Position3D(x: Int, y: Int, z: Int)
-}
+// =============================================================================
+// PUSH-SUM PROTOCOL TYPES
+// =============================================================================
 
-// Push-Sum types (for future use)
 pub type PushSumMessage {
   PushSumPair(s: Float, w: Float, sender_id: Int)
+  SetPushSumNeighbors(neighbors: List(process.Subject(PushSumMessage)))
+  SetPushSumSupervisor(supervisor: process.Subject(PushSumConvergenceMessage))
   PushSumShutdown
+  GetPushSumStatus
 }
 
 pub type PushSumState {
@@ -104,413 +118,111 @@ pub type PushSumState {
     w: Float,
     prev_ratios: List(Float),
     total_nodes: Int,
-    active: Bool,
+    terminated: Bool,
+    supervisor: option.Option(process.Subject(PushSumConvergenceMessage)),
+    round_count: Int,
   )
 }
 
-// CONVERGENCE MONITOR IMPLEMENTATION
-pub fn start_convergence_monitor(
-  total_nodes: Int,
-  topology: Topology,
-) -> Result(process.Subject(ConvergenceMessage), actor.StartError) {
-  let threshold = get_convergence_threshold(topology)
-  let initial_state =
-    ConvergenceState(
-      total_nodes: total_nodes,
-      nodes_with_rumor: set.new(),
-      terminated_nodes: set.new(),
-      convergence_achieved: False,
-      convergence_time: None,
-      start_time: 0,
-      convergence_threshold: threshold,
-      topology: topology,
-      monitoring_active: False,
-    )
+// =============================================================================
+// PUSH-SUM CONVERGENCE MONITOR TYPES
+// =============================================================================
 
-  case
-    actor.new(initial_state)
-    |> actor.on_message(handle_convergence_message)
-    |> actor.start()
-  {
-    Ok(started) -> Ok(started.data)
-    Error(e) -> Error(e)
+pub type PushSumConvergenceMessage {
+  NodeConverged(node_id: Int, final_estimate: Float)
+  CheckPushSumConvergenceStatus
+  GetPushSumConvergenceResult(
+    reply_to: process.Subject(PushSumConvergenceResult),
+  )
+  StartPushSumMonitoring
+  StopPushSumMonitoring
+}
+
+pub type PushSumConvergenceState {
+  PushSumConvergenceState(
+    total_nodes: Int,
+    converged_nodes: Set(Int),
+    node_estimates: Dict(Int, Float),
+    convergence_achieved: Bool,
+    convergence_time: option.Option(Int),
+    start_time: Int,
+    monitoring_active: Bool,
+    expected_average: Float,
+  )
+}
+
+pub type PushSumConvergenceResult {
+  PushSumConvergenceResult(
+    converged: Bool,
+    time_to_convergence: option.Option(Int),
+    convergence_percentage: Float,
+    converged_nodes: Int,
+    total_nodes: Int,
+    average_estimate: Float,
+    expected_average: Float,
+  )
+}
+
+// =============================================================================
+// UTILITY FUNCTIONS
+// =============================================================================
+
+fn get_current_time_ms() -> Int {
+  let ts = timestamp.system_time()
+  let #(seconds, nanoseconds) = timestamp.to_unix_seconds_and_nanoseconds(ts)
+  seconds * 1000 + nanoseconds / 1_000_000
+}
+
+fn bool_to_string(b: Bool) -> String {
+  case b {
+    True -> "true"
+    False -> "false"
   }
 }
 
-pub fn handle_convergence_message(
-  state: ConvergenceState,
-  message: ConvergenceMessage,
-) -> actor.Next(ConvergenceState, ConvergenceMessage) {
-  case message {
-    StartMonitoring -> {
-      io.println("Convergence Monitor: Starting to monitor network convergence")
-      let start_time = get_current_time_ms()
-      let updated_state =
-        ConvergenceState(
-          ..state,
-          monitoring_active: True,
-          start_time: start_time,
-        )
-      actor.continue(updated_state)
-    }
-
-    NodeFirstHeardRumor(node_id) -> {
-      case state.monitoring_active {
-        True -> {
-          let updated_nodes = set.insert(state.nodes_with_rumor, node_id)
-          let coverage =
-            int.to_float(set.size(updated_nodes))
-            /. int.to_float(state.total_nodes)
-
-          io.println(
-            "📢 Node " <> int.to_string(node_id) <> " heard rumor for FIRST time",
-          )
-          io.println(
-            "   Coverage: "
-            <> int.to_string(set.size(updated_nodes))
-            <> "/"
-            <> int.to_string(state.total_nodes)
-            <> " = "
-            <> float.to_string(coverage *. 100.0)
-            <> "%",
-          )
-
-          case
-            coverage >=. state.convergence_threshold
-            && !state.convergence_achieved
-          {
-            True -> {
-              let current_time = get_current_time_ms()
-              let elapsed = current_time - state.start_time
-
-              io.println("🎉 CONVERGENCE ACHIEVED!")
-              io.println(
-                "   Time to convergence: " <> int.to_string(elapsed) <> "ms",
-              )
-              io.println(
-                "   Final coverage: "
-                <> float.to_string(coverage *. 100.0)
-                <> "%",
-              )
-              io.println("   Topology: " <> topology_to_string(state.topology))
-
-              let converged_state =
-                ConvergenceState(
-                  ..state,
-                  nodes_with_rumor: updated_nodes,
-                  convergence_achieved: True,
-                  convergence_time: Some(elapsed),
-                )
-              actor.continue(converged_state)
-            }
-            False -> {
-              let updated_state =
-                ConvergenceState(..state, nodes_with_rumor: updated_nodes)
-              actor.continue(updated_state)
-            }
-          }
-        }
-        False -> {
-          io.println("⚠️ Received NodeFirstHeardRumor but monitoring not active")
-          actor.continue(state)
-        }
-      }
-    }
-
-    NodeTerminated(node_id) -> {
-      let updated_terminated = set.insert(state.terminated_nodes, node_id)
-      let terminated_count = set.size(updated_terminated)
-
-      io.println("💀 Node " <> int.to_string(node_id) <> " terminated")
-      io.println(
-        "   Terminated nodes: "
-        <> int.to_string(terminated_count)
-        <> "/"
-        <> int.to_string(state.total_nodes),
-      )
-
-      let updated_state =
-        ConvergenceState(..state, terminated_nodes: updated_terminated)
-      actor.continue(updated_state)
-    }
-
-    CheckConvergenceStatus -> {
-      let coverage =
-        int.to_float(set.size(state.nodes_with_rumor))
-        /. int.to_float(state.total_nodes)
-      let terminated_count = set.size(state.terminated_nodes)
-
-      io.println("📊 CONVERGENCE STATUS:")
-      io.println(
-        "   Nodes with rumor: "
-        <> string.inspect(set.to_list(state.nodes_with_rumor))
-        <> "/"
-        <> int.to_string(state.total_nodes)
-        <> " ("
-        <> float.to_string(coverage *. 100.0)
-        <> "%)",
-      )
-      // io.println(
-      //   "   Nodes with rumor: "
-      //   <> int.to_string(set.size(state.nodes_with_rumor))
-      //   <> "/"
-      //   <> int.to_string(state.total_nodes)
-      //   <> " ("
-      //   <> float.to_string(coverage *. 100.0)
-      //   <> "%)",
-      // )
-      io.println(
-        "   Terminated nodes: "
-        <> int.to_string(terminated_count)
-        <> "/"
-        <> int.to_string(state.total_nodes),
-      )
-      io.println("   Converged: " <> bool_to_string(state.convergence_achieved))
-
-      case state.convergence_achieved {
-        True -> {
-          case state.convergence_time {
-            Some(time) ->
-              io.println("   Convergence time: " <> int.to_string(time) <> "ms")
-            None -> io.println("   Convergence time: Unknown")
-          }
-        }
-        False -> {
-          case state.monitoring_active {
-            True -> {
-              let current_time = get_current_time_ms()
-              let elapsed = current_time - state.start_time
-              io.println("   Running time: " <> int.to_string(elapsed) <> "ms")
-            }
-            False -> io.println("   Monitoring not started")
-          }
-        }
-      }
-
-      actor.continue(state)
-    }
-
-    GetConvergenceResult(reply_to) -> {
-      let coverage =
-        int.to_float(set.size(state.nodes_with_rumor))
-        /. int.to_float(state.total_nodes)
-      let result =
-        ConvergenceResult(
-          converged: state.convergence_achieved,
-          time_to_convergence: state.convergence_time,
-          coverage_percentage: coverage,
-          nodes_with_rumor: set.size(state.nodes_with_rumor),
-          total_nodes: state.total_nodes,
-          terminated_nodes: set.size(state.terminated_nodes),
-        )
-
-      process.send(reply_to, result)
-      actor.continue(state)
-    }
-
-    StopMonitoring -> {
-      let final_state = ConvergenceState(..state, monitoring_active: False)
-      actor.continue(final_state)
-    }
-  }
-}
-
-fn get_convergence_threshold(topology: Topology) -> Float {
+fn topology_to_string(topology: Topology) -> String {
   case topology {
-    Full -> 0.98
-    // 98% - should reach almost everyone
-    Imperfect3D -> 0.95
-    // 95% - good connectivity  
-    ThreeD -> 0.9
-    // 90% - some nodes might be isolated
-    Line -> 0.8
-    // 80% - line topology is fragile
+    Full -> "Full Network"
+    ThreeD -> "3D Grid"
+    Line -> "Line"
+    Imperfect3D -> "Imperfect 3D Grid"
   }
 }
 
-// ENHANCED GOSSIP ACTOR IMPLEMENTATION
-pub fn start_gossip_actor_with_supervisor(
-  id: Int,
-  total_nodes: Int,
-) -> Result(process.Subject(GossipMessage), actor.StartError) {
-  let initial_state =
-    GossipState(
-      id: id,
-      neighbors: [],
-      rumor_count: 0,
-      has_rumor: False,
-      rumor_content: "",
-      total_nodes: total_nodes,
-      terminated: False,
-      supervisor: None,
-    )
-
-  case
-    actor.new(initial_state)
-    |> actor.on_message(handle_gossip_message_with_supervisor)
-    |> actor.start()
-  {
-    Ok(started) -> Ok(started.data)
-    Error(e) -> Error(e)
+fn algorithm_to_string(algorithm: Algorithm) -> String {
+  case algorithm {
+    Gossip -> "Gossip"
+    PushSum -> "Push-Sum"
   }
 }
 
-pub fn handle_gossip_message_with_supervisor(
-  state: GossipState,
-  message: GossipMessage,
-) -> actor.Next(GossipState, GossipMessage) {
-  case message {
-    SetNeighbors(new_neighbors) -> {
-      let updated_state = GossipState(..state, neighbors: new_neighbors)
-      actor.continue(updated_state)
-    }
-
-    SetSupervisor(supervisor) -> {
-      io.println(
-        "Node " <> int.to_string(state.id) <> " received supervisor reference",
-      )
-      let updated_state = GossipState(..state, supervisor: Some(supervisor))
-      actor.continue(updated_state)
-    }
-
-    Rumor(content, sender_id) -> {
-      case state.terminated {
-        True -> actor.continue(state)
-        False -> {
-          let is_first_time = !state.has_rumor
-          let new_count = case state.has_rumor {
-            True -> state.rumor_count + 1
-            False -> 1
-          }
-
-          let new_state =
-            GossipState(
-              ..state,
-              has_rumor: True,
-              rumor_content: content,
-              rumor_count: new_count,
-            )
-
-          // Report to supervisor if first time hearing
-          case is_first_time, state.supervisor {
-            True, Some(supervisor) -> {
-              io.println(
-                "🎯 Node "
-                <> int.to_string(state.id)
-                <> " heard rumor for FIRST time from Node "
-                <> int.to_string(sender_id),
-              )
-              process.send(supervisor, NodeFirstHeardRumor(state.id))
-            }
-            _, _ -> Nil
-          }
-
-          // Check termination condition
-          case new_count >= 10 {
-            True -> {
-              io.println(
-                "💀 Node "
-                <> int.to_string(state.id)
-                <> " terminating after hearing rumor "
-                <> int.to_string(new_count)
-                <> " times",
-              )
-
-              case state.supervisor {
-                Some(supervisor) ->
-                  process.send(supervisor, NodeTerminated(state.id))
-                None -> Nil
-              }
-
-              let terminated_state = GossipState(..new_state, terminated: True)
-              actor.continue(terminated_state)
-            }
-            False -> {
-              spread_rumor(new_state)
-              actor.continue(new_state)
-            }
-          }
-        }
-      }
-    }
-
-    Shutdown -> {
-      io.println("Node " <> int.to_string(state.id) <> " shutting down")
-      actor.stop()
-    }
-
-    GetStatus -> {
-      io.println(
-        "Node "
-        <> int.to_string(state.id)
-        <> " - Rumor count: "
-        <> int.to_string(state.rumor_count)
-        <> ", Terminated: "
-        <> bool_to_string(state.terminated),
-      )
-      actor.continue(state)
-    }
-  }
-}
-
-fn spread_rumor(state: GossipState) -> Nil {
-  case state.neighbors {
-    [] -> Nil
-    [single_neighbor] -> {
-      let rumor_message = Rumor(state.rumor_content, state.id)
-      process.send(single_neighbor, rumor_message)
-    }
-    multiple_neighbors -> {
-      let neighbor_count = list.length(multiple_neighbors)
-      let random_index = int.random(neighbor_count)
-
-      case list.drop(multiple_neighbors, random_index) |> list.first() {
-        Ok(selected_neighbor) -> {
-          let rumor_message = Rumor(state.rumor_content, state.id)
-          process.send(selected_neighbor, rumor_message)
-        }
-        Error(_) -> Nil
-      }
-      // let neighbor_count = list.length(multiple_neighbors)
-      // let selected_index = int.random(neighbor_count)
-
-      // case get_neighbor_at_index(multiple_neighbors, selected_index) {
-      //   Ok(neighbor) -> {
-      //     let rumor_message = Rumor(state.rumor_content, state.id)
-      //     process.send(neighbor, rumor_message)
-      //   }
-      //   Error(_) -> Nil
-      // }
-    }
-    // multiple_neighbors -> {
-    //   let neighbor_count = list.length(multiple_neighbors)
-    //   let selected_index = state.rumor_count % neighbor_count
-
-    //   case get_neighbor_at_index(multiple_neighbors, selected_index) {
-    //     Ok(neighbor) -> {
-    //       let rumor_message = Rumor(state.rumor_content, state.id)
-    //       process.send(neighbor, rumor_message)
-    //     }
-    //     Error(_) -> Nil
-    //   }
-    // }
-  }
-}
-
-fn get_neighbor_at_index(
-  neighbors: List(process.Subject(GossipMessage)),
-  index: Int,
-) -> Result(process.Subject(GossipMessage), Nil) {
+fn get_element_at_index(list: List(a), index: Int) -> Result(a, Nil) {
   case index >= 0 {
     True -> {
-      list.drop(neighbors, index)
+      list.drop(list, index)
       |> list.first()
     }
     False -> Error(Nil)
   }
 }
 
+fn get_convergence_threshold(topology: Topology) -> Float {
+  case topology {
+    Full -> 0.2
+    Imperfect3D -> 0.91
+    ThreeD -> 0.91
+    Line -> 0.8
+  }
+}
+
+fn calculate_expected_average(total_nodes: Int) -> Float {
+  int.to_float(total_nodes - 1) /. 2.0
+}
+
+// =============================================================================
 // TOPOLOGY BUILDING FUNCTIONS
+// =============================================================================
+
 pub fn build_neighbors(
   topology: Topology,
   num_nodes: Int,
@@ -656,22 +368,1019 @@ fn find_position_index(
   }
 }
 
-fn get_element_at_index(list: List(a), index: Int) -> Result(a, Nil) {
+// =============================================================================
+// GOSSIP CONVERGENCE MONITOR IMPLEMENTATION
+// =============================================================================
+
+pub fn start_convergence_monitor(
+  total_nodes: Int,
+  topology: Topology,
+) -> Result(process.Subject(ConvergenceMessage), actor.StartError) {
+  let threshold = get_convergence_threshold(topology)
+  let initial_state =
+    ConvergenceState(
+      total_nodes: total_nodes,
+      nodes_with_rumor: set.new(),
+      terminated_nodes: set.new(),
+      convergence_achieved: False,
+      convergence_time: None,
+      start_time: 0,
+      convergence_threshold: threshold,
+      topology: topology,
+      monitoring_active: False,
+    )
+
+  case
+    actor.new(initial_state)
+    |> actor.on_message(handle_convergence_message)
+    |> actor.start()
+  {
+    Ok(started) -> Ok(started.data)
+    Error(e) -> Error(e)
+  }
+}
+
+pub fn handle_convergence_message(
+  state: ConvergenceState,
+  message: ConvergenceMessage,
+) -> actor.Next(ConvergenceState, ConvergenceMessage) {
+  case message {
+    StartMonitoring -> {
+      io.println("Convergence Monitor: Starting to monitor network convergence")
+      let start_time = get_current_time_ms()
+      let updated_state =
+        ConvergenceState(
+          ..state,
+          monitoring_active: True,
+          start_time: start_time,
+        )
+      actor.continue(updated_state)
+    }
+
+    NodeFirstHeardRumor(node_id) -> {
+      case state.monitoring_active {
+        True -> {
+          let updated_nodes = set.insert(state.nodes_with_rumor, node_id)
+          let coverage =
+            int.to_float(set.size(updated_nodes))
+            /. int.to_float(state.total_nodes)
+
+          io.println(
+            "Node " <> int.to_string(node_id) <> " heard rumor for first time",
+          )
+          io.println(
+            "   Coverage: "
+            <> int.to_string(set.size(updated_nodes))
+            <> "/"
+            <> int.to_string(state.total_nodes)
+            <> " = "
+            <> float.to_string(coverage *. 100.0)
+            <> "%",
+          )
+
+          case
+            coverage >=. state.convergence_threshold
+            && !state.convergence_achieved
+          {
+            True -> {
+              let current_time = get_current_time_ms()
+              let elapsed = current_time - state.start_time
+
+              io.println("CONVERGENCE ACHIEVED!")
+              io.println(
+                "   Time to convergence: " <> int.to_string(elapsed) <> "ms",
+              )
+              io.println(
+                "   Final coverage: "
+                <> float.to_string(coverage *. 100.0)
+                <> "%",
+              )
+              io.println("   Topology: " <> topology_to_string(state.topology))
+
+              let converged_state =
+                ConvergenceState(
+                  ..state,
+                  nodes_with_rumor: updated_nodes,
+                  convergence_achieved: True,
+                  convergence_time: Some(elapsed),
+                )
+              actor.continue(converged_state)
+            }
+            False -> {
+              let updated_state =
+                ConvergenceState(..state, nodes_with_rumor: updated_nodes)
+              actor.continue(updated_state)
+            }
+          }
+        }
+        False -> {
+          io.println(
+            "Warning: Received NodeFirstHeardRumor but monitoring not active",
+          )
+          actor.continue(state)
+        }
+      }
+    }
+
+    NodeTerminated(node_id) -> {
+      let updated_terminated = set.insert(state.terminated_nodes, node_id)
+      let terminated_count = set.size(updated_terminated)
+
+      io.println("Node " <> int.to_string(node_id) <> " terminated")
+      io.println(
+        "   Terminated nodes: "
+        <> int.to_string(terminated_count)
+        <> "/"
+        <> int.to_string(state.total_nodes),
+      )
+
+      let updated_state =
+        ConvergenceState(..state, terminated_nodes: updated_terminated)
+      actor.continue(updated_state)
+    }
+
+    CheckConvergenceStatus -> {
+      let coverage =
+        int.to_float(set.size(state.nodes_with_rumor))
+        /. int.to_float(state.total_nodes)
+      let terminated_count = set.size(state.terminated_nodes)
+
+      io.println("CONVERGENCE STATUS:")
+      io.println(
+        "   Nodes with rumor: "
+        <> string.inspect(set.to_list(state.nodes_with_rumor))
+        <> "/"
+        <> int.to_string(state.total_nodes)
+        <> " ("
+        <> float.to_string(coverage *. 100.0)
+        <> "%)",
+      )
+      io.println(
+        "   Terminated nodes: "
+        <> int.to_string(terminated_count)
+        <> "/"
+        <> int.to_string(state.total_nodes),
+      )
+      io.println("   Converged: " <> bool_to_string(state.convergence_achieved))
+
+      case state.convergence_achieved {
+        True -> {
+          case state.convergence_time {
+            Some(time) ->
+              io.println("   Convergence time: " <> int.to_string(time) <> "ms")
+            None -> io.println("   Convergence time: Unknown")
+          }
+        }
+        False -> {
+          case state.monitoring_active {
+            True -> {
+              let current_time = get_current_time_ms()
+              let elapsed = current_time - state.start_time
+              io.println("   Running time: " <> int.to_string(elapsed) <> "ms")
+            }
+            False -> io.println("   Monitoring not started")
+          }
+        }
+      }
+
+      actor.continue(state)
+    }
+
+    GetConvergenceResult(reply_to) -> {
+      let coverage =
+        int.to_float(set.size(state.nodes_with_rumor))
+        /. int.to_float(state.total_nodes)
+      let result =
+        ConvergenceResult(
+          converged: state.convergence_achieved,
+          time_to_convergence: state.convergence_time,
+          coverage_percentage: coverage,
+          nodes_with_rumor: set.size(state.nodes_with_rumor),
+          total_nodes: state.total_nodes,
+          terminated_nodes: set.size(state.terminated_nodes),
+        )
+
+      process.send(reply_to, result)
+      actor.continue(state)
+    }
+
+    StopMonitoring -> {
+      let final_state = ConvergenceState(..state, monitoring_active: False)
+      actor.continue(final_state)
+    }
+  }
+}
+
+// =============================================================================
+// GOSSIP ACTOR IMPLEMENTATION
+// =============================================================================
+
+pub fn start_gossip_actor_with_supervisor(
+  id: Int,
+  total_nodes: Int,
+) -> Result(process.Subject(GossipMessage), actor.StartError) {
+  let initial_state =
+    GossipState(
+      id: id,
+      neighbors: [],
+      rumor_count: 0,
+      has_rumor: False,
+      rumor_content: "",
+      total_nodes: total_nodes,
+      terminated: False,
+      supervisor: None,
+    )
+
+  case
+    actor.new(initial_state)
+    |> actor.on_message(handle_gossip_message_with_supervisor)
+    |> actor.start()
+  {
+    Ok(started) -> Ok(started.data)
+    Error(e) -> Error(e)
+  }
+}
+
+pub fn handle_gossip_message_with_supervisor(
+  state: GossipState,
+  message: GossipMessage,
+) -> actor.Next(GossipState, GossipMessage) {
+  case message {
+    SetNeighbors(new_neighbors) -> {
+      let neighbor_count = list.length(new_neighbors)
+      // io.println(
+      //   "Node "
+      //   <> int.to_string(state.id)
+      //   <> " received "
+      //   <> int.to_string(neighbor_count)
+      //   <> " neighbors",
+      // )
+      let updated_state = GossipState(..state, neighbors: new_neighbors)
+      actor.continue(updated_state)
+    }
+
+    SetSupervisor(supervisor) -> {
+      // io.println(
+      //   "Node " <> int.to_string(state.id) <> " received supervisor reference",
+      // )
+      let updated_state = GossipState(..state, supervisor: Some(supervisor))
+      actor.continue(updated_state)
+    }
+
+    Rumor(content, sender_id) -> {
+      case state.terminated {
+        True -> {
+          io.println(
+            "Node "
+            <> int.to_string(state.id)
+            <> " (TERMINATED) received rumor from Node "
+            <> int.to_string(sender_id)
+            <> " but ignoring it",
+          )
+          actor.continue(state)
+        }
+        False -> {
+          let is_first_time = !state.has_rumor
+          let new_count = case state.has_rumor {
+            True -> state.rumor_count + 1
+            False -> 1
+          }
+
+          let new_state =
+            GossipState(
+              ..state,
+              has_rumor: True,
+              rumor_content: content,
+              rumor_count: new_count,
+            )
+
+          case is_first_time {
+            True -> {
+              io.println(
+                "Node "
+                <> int.to_string(state.id)
+                <> " heard rumor for FIRST time from Node "
+                <> int.to_string(sender_id)
+                <> " - '"
+                <> content
+                <> "'",
+              )
+              case state.supervisor {
+                Some(supervisor) ->
+                  process.send(supervisor, NodeFirstHeardRumor(state.id))
+                None -> Nil
+              }
+            }
+            False -> {
+              io.println(
+                "Node "
+                <> int.to_string(state.id)
+                <> " heard rumor again from Node "
+                <> int.to_string(sender_id)
+                <> " (count now: "
+                <> int.to_string(new_count)
+                <> ")",
+              )
+            }
+          }
+
+          case new_count >= 30 {
+            True -> {
+              io.println(
+                "Node "
+                <> int.to_string(state.id)
+                <> " TERMINATING after hearing rumor "
+                <> int.to_string(new_count)
+                <> " times - no more spreading",
+              )
+
+              case state.supervisor {
+                Some(supervisor) ->
+                  process.send(supervisor, NodeTerminated(state.id))
+                None -> Nil
+              }
+
+              let terminated_state = GossipState(..new_state, terminated: True)
+              actor.continue(terminated_state)
+            }
+            False -> {
+              io.println(
+                "Node "
+                <> int.to_string(state.id)
+                <> " will now spread rumor (heard "
+                <> int.to_string(new_count)
+                <> " times so far)",
+              )
+              spread_rumor(new_state)
+              actor.continue(new_state)
+            }
+          }
+        }
+      }
+    }
+
+    Shutdown -> {
+      io.println("Node " <> int.to_string(state.id) <> " shutting down")
+      actor.stop()
+    }
+
+    GetStatus -> {
+      io.println(
+        "Node "
+        <> int.to_string(state.id)
+        <> " - Rumor count: "
+        <> int.to_string(state.rumor_count)
+        <> ", Terminated: "
+        <> bool_to_string(state.terminated),
+      )
+      actor.continue(state)
+    }
+  }
+}
+
+fn spread_rumor(state: GossipState) -> Nil {
+  case state.neighbors {
+    [] -> {
+      io.println(
+        "Node "
+        <> int.to_string(state.id)
+        <> " has no neighbors to spread rumor to",
+      )
+      Nil
+    }
+    [single_neighbor] -> {
+      let rumor_message = Rumor(state.rumor_content, state.id)
+      io.println(
+        "Node "
+        <> int.to_string(state.id)
+        <> " spreading rumor to its only neighbor (rumor count: "
+        <> int.to_string(state.rumor_count)
+        <> ")",
+      )
+      process.send(single_neighbor, rumor_message)
+    }
+    multiple_neighbors -> {
+      let neighbor_count = list.length(multiple_neighbors)
+      let random_index = int.random(neighbor_count)
+      case get_neighbor_at_index(multiple_neighbors, random_index) {
+        Ok(selected_neighbor) -> {
+          let rumor_message = Rumor(state.rumor_content, state.id)
+          io.println(
+            "Node "
+            <> int.to_string(state.id)
+            <> " spreading rumor to random neighbor (index "
+            <> int.to_string(random_index)
+            <> " of "
+            <> int.to_string(neighbor_count - 1)
+            <> ") - rumor count: "
+            <> int.to_string(state.rumor_count),
+          )
+          process.send(selected_neighbor, rumor_message)
+        }
+        Error(_) -> {
+          case list.first(multiple_neighbors) {
+            Ok(first_neighbor) -> {
+              let rumor_message = Rumor(state.rumor_content, state.id)
+              io.println(
+                "Node "
+                <> int.to_string(state.id)
+                <> " spreading rumor to first neighbor (fallback) - rumor count: "
+                <> int.to_string(state.rumor_count),
+              )
+              process.send(first_neighbor, rumor_message)
+            }
+            Error(_) -> {
+              io.println(
+                "Node "
+                <> int.to_string(state.id)
+                <> " failed to find any valid neighbor",
+              )
+              Nil
+            }
+          }
+        }
+      }
+    }
+  }
+}
+
+fn get_neighbor_at_index(
+  neighbors: List(process.Subject(GossipMessage)),
+  index: Int,
+) -> Result(process.Subject(GossipMessage), Nil) {
   case index >= 0 {
     True -> {
-      list.drop(list, index)
+      list.drop(neighbors, index)
       |> list.first()
     }
     False -> Error(Nil)
   }
 }
 
-// ENHANCED SIMULATION RUNNER
+// =============================================================================
+// PUSH-SUM CONVERGENCE MONITOR IMPLEMENTATION
+// =============================================================================
+
+pub fn start_pushsum_convergence_monitor(
+  total_nodes: Int,
+) -> Result(process.Subject(PushSumConvergenceMessage), actor.StartError) {
+  let expected_average = calculate_expected_average(total_nodes)
+  let initial_state =
+    PushSumConvergenceState(
+      total_nodes: total_nodes,
+      converged_nodes: set.new(),
+      node_estimates: dict.new(),
+      convergence_achieved: False,
+      convergence_time: None,
+      start_time: 0,
+      monitoring_active: False,
+      expected_average: expected_average,
+    )
+
+  case
+    actor.new(initial_state)
+    |> actor.on_message(handle_pushsum_convergence_message)
+    |> actor.start()
+  {
+    Ok(started) -> Ok(started.data)
+    Error(e) -> Error(e)
+  }
+}
+
+pub fn handle_pushsum_convergence_message(
+  state: PushSumConvergenceState,
+  message: PushSumConvergenceMessage,
+) -> actor.Next(PushSumConvergenceState, PushSumConvergenceMessage) {
+  case message {
+    StartPushSumMonitoring -> {
+      io.println("Push-Sum Monitor: Starting to monitor convergence")
+      let start_time = get_current_time_ms()
+      let updated_state =
+        PushSumConvergenceState(
+          ..state,
+          monitoring_active: True,
+          start_time: start_time,
+        )
+      actor.continue(updated_state)
+    }
+    NodeConverged(node_id, final_estimate) -> {
+      case state.monitoring_active {
+        True -> {
+          let updated_nodes = set.insert(state.converged_nodes, node_id)
+          let updated_estimates =
+            dict.insert(state.node_estimates, node_id, final_estimate)
+          let convergence_percentage =
+            int.to_float(set.size(updated_nodes))
+            /. int.to_float(state.total_nodes)
+
+          io.println(
+            "Node "
+            <> int.to_string(node_id)
+            <> " converged with estimate: "
+            <> float.to_string(final_estimate),
+          )
+          io.println(
+            "   Expected average: " <> float.to_string(state.expected_average),
+          )
+          io.println(
+            "   Error: "
+            <> float.to_string(float.absolute_value(
+              final_estimate -. state.expected_average,
+            )),
+          )
+          io.println(
+            "   Convergence: "
+            <> int.to_string(set.size(updated_nodes))
+            <> "/"
+            <> int.to_string(state.total_nodes)
+            <> " = "
+            <> float.to_string(convergence_percentage *. 100.0)
+            <> "%",
+          )
+
+          case convergence_percentage >=. 0.9 && !state.convergence_achieved {
+            True -> {
+              let current_time = get_current_time_ms()
+              let elapsed = current_time - state.start_time
+
+              io.println("PUSH-SUM CONVERGENCE ACHIEVED!")
+              io.println(
+                "   Time to convergence: " <> int.to_string(elapsed) <> "ms",
+              )
+              io.println(
+                "   Final convergence time: " <> int.to_string(elapsed) <> "ms",
+              )
+              io.println(
+                "   Converged nodes: "
+                <> int.to_string(set.size(updated_nodes))
+                <> "/"
+                <> int.to_string(state.total_nodes),
+              )
+
+              let converged_state =
+                PushSumConvergenceState(
+                  ..state,
+                  converged_nodes: updated_nodes,
+                  node_estimates: updated_estimates,
+                  convergence_achieved: True,
+                  convergence_time: Some(elapsed),
+                )
+              actor.continue(converged_state)
+            }
+            False -> {
+              let updated_state =
+                PushSumConvergenceState(
+                  ..state,
+                  converged_nodes: updated_nodes,
+                  node_estimates: updated_estimates,
+                )
+              actor.continue(updated_state)
+            }
+          }
+        }
+        False -> {
+          io.println(
+            "Warning: Received NodeConverged but monitoring not active",
+          )
+          actor.continue(state)
+        }
+      }
+    }
+
+    // NodeConverged(node_id, final_estimate) -> {
+    //   case state.monitoring_active {
+    //     True -> {
+    //       let updated_nodes = set.insert(state.converged_nodes, node_id)
+    //       let updated_estimates =
+    //         dict.insert(state.node_estimates, node_id, final_estimate)
+    //       let convergence_percentage =
+    //         int.to_float(set.size(updated_nodes))
+    //         /. int.to_float(state.total_nodes)
+    //       io.println(
+    //         "Node "
+    //         <> int.to_string(node_id)
+    //         <> " converged with estimate: "
+    //         <> float.to_string(final_estimate),
+    //       )
+    //       io.println(
+    //         "   Expected average: " <> float.to_string(state.expected_average),
+    //       )
+    //       io.println(
+    //         "   Error: "
+    //         <> float.to_string(float.absolute_value(
+    //           final_estimate -. state.expected_average,
+    //         )),
+    //       )
+    //       io.println(
+    //         "   Convergence: "
+    //         <> int.to_string(set.size(updated_nodes))
+    //         <> "/"
+    //         <> int.to_string(state.total_nodes)
+    //         <> " = "
+    //         <> float.to_string(convergence_percentage *. 100.0)
+    //         <> "%",
+    //       )
+    //       case convergence_percentage >=. 0.9 && !state.convergence_achieved {
+    //         True -> {
+    //           let current_time = get_current_time_ms()
+    //           let elapsed = current_time - state.start_time
+    //           io.println("PUSH-SUM CONVERGENCE ACHIEVED!")
+    //           io.println(
+    //             "   Time to convergence: " <> int.to_string(elapsed) <> "ms",
+    //           )
+    //           io.println(
+    //             "   Converged nodes: "
+    //             <> int.to_string(set.size(updated_nodes))
+    //             <> "/"
+    //             <> int.to_string(state.total_nodes),
+    //           )
+    //           let converged_state =
+    //             PushSumConvergenceState(
+    //               ..state,
+    //               converged_nodes: updated_nodes,
+    //               node_estimates: updated_estimates,
+    //               convergence_achieved: True,
+    //               convergence_time: Some(elapsed),
+    //             )
+    //           actor.continue(converged_state)
+    //         }
+    //         False -> {
+    //           let updated_state =
+    //             PushSumConvergenceState(
+    //               ..state,
+    //               converged_nodes: updated_nodes,
+    //               node_estimates: updated_estimates,
+    //             )
+    //           actor.continue(updated_state)
+    //         }
+    //       }
+    //     }
+    //     False -> {
+    //       io.println(
+    //         "Warning: Received NodeConverged but monitoring not active",
+    //       )
+    //       actor.continue(state)
+    //     }
+    //   }
+    // }
+    CheckPushSumConvergenceStatus -> {
+      let convergence_percentage =
+        int.to_float(set.size(state.converged_nodes))
+        /. int.to_float(state.total_nodes)
+
+      io.println("PUSH-SUM CONVERGENCE STATUS:")
+      io.println(
+        "   Converged nodes: "
+        <> int.to_string(set.size(state.converged_nodes))
+        <> "/"
+        <> int.to_string(state.total_nodes)
+        <> " ("
+        <> float.to_string(convergence_percentage *. 100.0)
+        <> "%)",
+      )
+      io.println(
+        "   Expected average: " <> float.to_string(state.expected_average),
+      )
+      io.println("   Converged: " <> bool_to_string(state.convergence_achieved))
+
+      dict.each(state.node_estimates, fn(node_id, estimate) {
+        let error = float.absolute_value(estimate -. state.expected_average)
+        io.println(
+          "   Node "
+          <> int.to_string(node_id)
+          <> ": "
+          <> float.to_string(estimate)
+          <> " (error: "
+          <> float.to_string(error)
+          <> ")",
+        )
+      })
+
+      case state.convergence_achieved {
+        True -> {
+          case state.convergence_time {
+            Some(time) ->
+              io.println("   Convergence time: " <> int.to_string(time) <> "ms")
+            None -> io.println("   Convergence time: Unknown")
+          }
+        }
+        False -> {
+          case state.monitoring_active {
+            True -> {
+              let current_time = get_current_time_ms()
+              let elapsed = current_time - state.start_time
+              io.println("   Running time: " <> int.to_string(elapsed) <> "ms")
+            }
+            False -> io.println("   Monitoring not started")
+          }
+        }
+      }
+
+      actor.continue(state)
+    }
+
+    GetPushSumConvergenceResult(reply_to) -> {
+      let convergence_percentage =
+        int.to_float(set.size(state.converged_nodes))
+        /. int.to_float(state.total_nodes)
+
+      let average_estimate = case set.size(state.converged_nodes) {
+        0 -> 0.0
+        n -> {
+          let sum =
+            dict.fold(state.node_estimates, 0.0, fn(acc, _, estimate) {
+              acc +. estimate
+            })
+          sum /. int.to_float(n)
+        }
+      }
+
+      let result =
+        PushSumConvergenceResult(
+          converged: state.convergence_achieved,
+          time_to_convergence: state.convergence_time,
+          convergence_percentage: convergence_percentage,
+          converged_nodes: set.size(state.converged_nodes),
+          total_nodes: state.total_nodes,
+          average_estimate: average_estimate,
+          expected_average: state.expected_average,
+        )
+
+      process.send(reply_to, result)
+      actor.continue(state)
+    }
+
+    StopPushSumMonitoring -> {
+      let final_state =
+        PushSumConvergenceState(..state, monitoring_active: False)
+      actor.continue(final_state)
+    }
+  }
+}
+
+// =============================================================================
+// PUSH-SUM ACTOR IMPLEMENTATION
+// =============================================================================
+
+pub fn start_pushsum_actor_with_supervisor(
+  id: Int,
+  total_nodes: Int,
+) -> Result(process.Subject(PushSumMessage), actor.StartError) {
+  let initial_state =
+    PushSumState(
+      id: id,
+      neighbors: [],
+      s: int.to_float(id),
+      w: 1.0,
+      prev_ratios: [],
+      total_nodes: total_nodes,
+      terminated: False,
+      supervisor: None,
+      round_count: 0,
+    )
+
+  case
+    actor.new(initial_state)
+    |> actor.on_message(handle_pushsum_message_with_supervisor)
+    |> actor.start()
+  {
+    Ok(started) -> Ok(started.data)
+    Error(e) -> Error(e)
+  }
+}
+
+pub fn handle_pushsum_message_with_supervisor(
+  state: PushSumState,
+  message: PushSumMessage,
+) -> actor.Next(PushSumState, PushSumMessage) {
+  case message {
+    SetPushSumNeighbors(new_neighbors) -> {
+      let updated_state = PushSumState(..state, neighbors: new_neighbors)
+      actor.continue(updated_state)
+    }
+
+    SetPushSumSupervisor(supervisor) -> {
+      io.println(
+        "Push-Sum Node "
+        <> int.to_string(state.id)
+        <> " received supervisor reference",
+      )
+      let updated_state = PushSumState(..state, supervisor: Some(supervisor))
+      actor.continue(updated_state)
+    }
+
+    PushSumPair(received_s, received_w, sender_id) -> {
+      case state.terminated {
+        True -> {
+          let new_s = state.s +. received_s
+          let new_w = state.w +. received_w
+
+          // io.println(
+          //   "Node "
+          //   <> int.to_string(state.id)
+          //   <> " (CONVERGED) received from Node "
+          //   <> int.to_string(sender_id)
+          //   <> " - s="
+          //   <> float.to_string(received_s)
+          //   <> ", w="
+          //   <> float.to_string(received_w),
+          // )
+
+          let updated_state = PushSumState(..state, s: new_s, w: new_w)
+          let final_state = send_pushsum_to_neighbor_and_update(updated_state)
+          actor.continue(final_state)
+        }
+        False -> {
+          let new_s = state.s +. received_s
+          let new_w = state.w +. received_w
+          let current_ratio = new_s /. new_w
+          let new_round_count = state.round_count + 1
+
+          // io.println(
+          //   "Node "
+          //   <> int.to_string(state.id)
+          //   <> " received from Node "
+          //   <> int.to_string(sender_id)
+          //   <> " - s="
+          //   <> float.to_string(received_s)
+          //   <> ", w="
+          //   <> float.to_string(received_w)
+          //   <> " | New ratio: "
+          //   <> float.to_string(current_ratio),
+          // )
+
+          let updated_ratios = [current_ratio, ..state.prev_ratios]
+          let ratios_to_keep = list.take(updated_ratios, 3)
+
+          let intermediate_state =
+            PushSumState(
+              ..state,
+              s: new_s,
+              w: new_w,
+              prev_ratios: ratios_to_keep,
+              round_count: new_round_count,
+            )
+
+          let final_state =
+            send_pushsum_to_neighbor_and_update(intermediate_state)
+
+          case check_pushsum_convergence(ratios_to_keep) {
+            True -> {
+              // io.println(
+              //   "Node "
+              //   <> int.to_string(state.id)
+              //   <> " converged! Final estimate: "
+              //   <> float.to_string(current_ratio)
+              //   <> " after "
+              //   <> int.to_string(new_round_count)
+              //   <> " rounds",
+              // )
+
+              case state.supervisor {
+                Some(supervisor) ->
+                  process.send(
+                    supervisor,
+                    NodeConverged(state.id, current_ratio),
+                  )
+                None -> Nil
+              }
+
+              let terminated_state =
+                PushSumState(..final_state, terminated: True)
+              actor.continue(terminated_state)
+            }
+            False -> {
+              actor.continue(final_state)
+            }
+          }
+        }
+      }
+    }
+
+    PushSumShutdown -> {
+      io.println(
+        "Push-Sum Node " <> int.to_string(state.id) <> " shutting down",
+      )
+      actor.stop()
+    }
+
+    GetPushSumStatus -> {
+      let current_ratio = case state.w >. 0.0 {
+        True -> state.s /. state.w
+        False -> 0.0
+      }
+      io.println(
+        "Push-Sum Node "
+        <> int.to_string(state.id)
+        <> " - s="
+        <> float.to_string(state.s)
+        <> ", w="
+        <> float.to_string(state.w)
+        <> ", ratio="
+        <> float.to_string(current_ratio)
+        <> ", rounds="
+        <> int.to_string(state.round_count)
+        <> ", terminated="
+        <> bool_to_string(state.terminated),
+      )
+      actor.continue(state)
+    }
+  }
+}
+
+fn send_pushsum_to_neighbor_and_update(state: PushSumState) -> PushSumState {
+  case state.neighbors {
+    [] -> state
+    neighbors -> {
+      let neighbor_count = list.length(neighbors)
+      let random_index = int.random(neighbor_count)
+      case get_pushsum_neighbor_at_index(neighbors, random_index) {
+        Ok(selected_neighbor) -> {
+          let half_s = state.s /. 2.0
+          let half_w = state.w /. 2.0
+          let message = PushSumPair(half_s, half_w, state.id)
+          process.send(selected_neighbor, message)
+
+          // io.println(
+          //   "Node "
+          //   <> int.to_string(state.id)
+          //   <> " sent half: s="
+          //   <> float.to_string(half_s)
+          //   <> ", w="
+          //   <> float.to_string(half_w)
+          //   <> " (keeping s="
+          //   <> float.to_string(half_s)
+          //   <> ", w="
+          //   <> float.to_string(half_w)
+          //   <> ")",
+          // )
+
+          PushSumState(..state, s: half_s, w: half_w)
+        }
+        Error(_) -> {
+          case list.first(neighbors) {
+            Ok(first_neighbor) -> {
+              let half_s = state.s /. 2.0
+              let half_w = state.w /. 2.0
+              let message = PushSumPair(half_s, half_w, state.id)
+              process.send(first_neighbor, message)
+              PushSumState(..state, s: half_s, w: half_w)
+            }
+            Error(_) -> state
+          }
+        }
+      }
+    }
+  }
+}
+
+fn check_pushsum_convergence(ratios: List(Float)) -> Bool {
+  case ratios {
+    [r1, r2, r3, ..] -> {
+      let diff1 = float.absolute_value(r1 -. r2)
+      let diff2 = float.absolute_value(r2 -. r3)
+      let threshold = 0.0000000001
+      let result = diff1 <=. threshold && diff2 <=. threshold
+
+      // io.println(
+      //   "   Convergence check: diff1="
+      //   <> float.to_string(diff1)
+      //   <> ", diff2="
+      //   <> float.to_string(diff2)
+      //   <> ", threshold="
+      //   <> float.to_string(threshold)
+      //   <> " -> "
+      //   <> bool_to_string(result),
+      // )
+
+      result
+    }
+    _ -> False
+  }
+}
+
+fn get_pushsum_neighbor_at_index(
+  neighbors: List(process.Subject(PushSumMessage)),
+  index: Int,
+) -> Result(process.Subject(PushSumMessage), Nil) {
+  case index >= 0 {
+    True -> {
+      list.drop(neighbors, index)
+      |> list.first()
+    }
+    False -> Error(Nil)
+  }
+}
+
+// =============================================================================
+// GOSSIP SIMULATION RUNNER
+// =============================================================================
+
 pub fn run_gossip_simulation_with_monitor(
   num_nodes: Int,
   topology: Topology,
 ) -> Nil {
-  io.println("🚀 Starting Gossip simulation with convergence monitoring...")
+  io.println("Starting Gossip simulation with convergence monitoring...")
   io.println("   Nodes: " <> int.to_string(num_nodes))
   io.println("   Topology: " <> topology_to_string(topology))
 
@@ -691,10 +1400,10 @@ pub fn run_gossip_simulation_with_monitor(
           process.send(monitor, StopMonitoring)
           shutdown_gossip_actors_enhanced(actors)
         }
-        Error(msg) -> io.println("❌ Failed to create actors: " <> msg)
+        Error(msg) -> io.println("Failed to create actors: " <> msg)
       }
     }
-    Error(_) -> io.println("❌ Failed to create convergence monitor")
+    Error(_) -> io.println("Failed to create convergence monitor")
   }
 }
 
@@ -716,9 +1425,7 @@ fn setup_supervisors(
 ) -> Nil {
   list.each(actors, fn(actor) { process.send(actor, SetSupervisor(monitor)) })
   io.println(
-    "✅ Set supervisor for all "
-    <> int.to_string(list.length(actors))
-    <> " actors",
+    "Set supervisor for all " <> int.to_string(list.length(actors)) <> " actors",
   )
 }
 
@@ -737,7 +1444,7 @@ fn setup_gossip_neighbors_enhanced(
       }
       Error(_) -> {
         io.println(
-          "⚠️  Warning: No neighbors found for actor " <> int.to_string(index),
+          "Warning: No neighbors found for actor " <> int.to_string(index),
         )
       }
     }
@@ -765,7 +1472,7 @@ fn initiate_gossip_enhanced(
   case actors {
     [] -> Nil
     [first_actor, ..] -> {
-      io.println("📡 Initiating gossip with rumor: '" <> rumor <> "'")
+      io.println("Initiating gossip with rumor: '" <> rumor <> "'")
       process.send(first_actor, Rumor(rumor, -1))
     }
   }
@@ -790,21 +1497,19 @@ fn monitor_convergence_loop(
   case current_time - start_time > timeout_ms {
     True -> {
       io.println(
-        "⏰ TIMEOUT: Convergence monitoring stopped after "
+        "TIMEOUT: Convergence monitoring stopped after "
         <> int.to_string(timeout_ms)
         <> "ms",
       )
       process.send(monitor, CheckConvergenceStatus)
     }
     False -> {
-      // Ask the monitor for the current convergence result
       let result = process.call(monitor, 1000, GetConvergenceResult)
       let ConvergenceResult(converged: converged, ..) = result
 
       case converged {
         True -> {
-          io.println("✅ Convergence achieved. Exiting run loop.")
-          // Return without recursion; caller will perform cleanup and exit
+          io.println("Convergence achieved. Exiting run loop.")
           Nil
         }
         False -> {
@@ -825,7 +1530,7 @@ fn monitor_convergence_loop(
 fn print_final_convergence_results(
   monitor: process.Subject(ConvergenceMessage),
 ) -> Nil {
-  io.println("📋 FINAL CONVERGENCE RESULTS:")
+  io.println("FINAL CONVERGENCE RESULTS:")
   let result = process.call(monitor, 1000, GetConvergenceResult)
   let ConvergenceResult(
     converged: c,
@@ -858,96 +1563,242 @@ fn print_final_convergence_results(
 fn shutdown_gossip_actors_enhanced(
   actors: List(process.Subject(GossipMessage)),
 ) -> Nil {
-  io.println("🔄 Shutting down all gossip actors...")
+  io.println("Shutting down all gossip actors...")
   list.each(actors, fn(actor) { process.send(actor, Shutdown) })
 }
 
-// UTILITY FUNCTIONS
-fn get_current_time_ms() -> Int {
-  // Placeholder - implement with proper Gleam time functions
-  let ts = timestamp.system_time()
-  let #(seconds, nanoseconds) = timestamp.to_unix_seconds_and_nanoseconds(ts)
+// =============================================================================
+// PUSH-SUM SIMULATION RUNNER
+// =============================================================================
 
-  // Convert to milliseconds
-  seconds * 1000 + nanoseconds / 1_000_000
-}
+pub fn run_pushsum_simulation_with_monitor(
+  num_nodes: Int,
+  topology: Topology,
+) -> Nil {
+  io.println("Starting Push-Sum simulation with convergence monitoring...")
+  io.println("   Nodes: " <> int.to_string(num_nodes))
+  io.println("   Topology: " <> topology_to_string(topology))
+  io.println(
+    "   Expected average: "
+    <> float.to_string(calculate_expected_average(num_nodes)),
+  )
 
-fn bool_to_string(b: Bool) -> String {
-  case b {
-    True -> "true"
-    False -> "false"
-  }
-}
+  case start_pushsum_convergence_monitor(num_nodes) {
+    Ok(monitor) -> {
+      case create_pushsum_actors_with_supervisor(num_nodes) {
+        Ok(actors) -> {
+          setup_pushsum_supervisors(actors, monitor)
+          let neighbor_map = build_neighbors(topology, num_nodes)
+          setup_pushsum_neighbors(actors, neighbor_map)
 
-fn topology_to_string(topology: Topology) -> String {
-  case topology {
-    Full -> "Full Network"
-    ThreeD -> "3D Grid"
-    Line -> "Line"
-    Imperfect3D -> "Imperfect 3D Grid"
-  }
-}
+          process.send(monitor, StartPushSumMonitoring)
+          initiate_pushsum(actors)
+          wait_for_pushsum_convergence_with_monitor(monitor, 120_000)
+          print_final_pushsum_convergence_results(monitor)
 
-fn algorithm_to_string(algorithm: Algorithm) -> String {
-  case algorithm {
-    Gossip -> "Gossip"
-    PushSum -> "Push-Sum"
-  }
-}
-
-// MAIN ENTRY POINT
-pub fn main() {
-  case parse_command_args() {
-    Ok(#(num_nodes, topology, algorithm)) -> {
-      io.println("Starting Enhanced Gossip Protocol Simulation")
-      io.println("Nodes: " <> int.to_string(num_nodes))
-      io.println("Topology: " <> topology_to_string(topology))
-      io.println("Algorithm: " <> algorithm_to_string(algorithm))
-
-      case algorithm {
-        Gossip -> run_gossip_simulation_with_monitor(num_nodes, topology)
-        PushSum -> run_pushsum_simulation(num_nodes, topology)
+          process.send(monitor, StopPushSumMonitoring)
+          shutdown_pushsum_actors(actors)
+        }
+        Error(msg) -> io.println("Failed to create Push-Sum actors: " <> msg)
       }
     }
-    Error(msg) -> {
-      io.println("Error: " <> msg)
-      io.println("Usage: project2 <numNodes> <topology> <algorithm>")
-      io.println("Topology: full, 3D, line, imp3D")
-      io.println("Algorithm: gossip, push-sum")
+    Error(_) -> io.println("Failed to create Push-Sum convergence monitor")
+  }
+}
+
+fn create_pushsum_actors_with_supervisor(
+  num_nodes: Int,
+) -> Result(List(process.Subject(PushSumMessage)), String) {
+  list.range(0, num_nodes - 1)
+  |> list.try_map(fn(id) {
+    case start_pushsum_actor_with_supervisor(id, num_nodes) {
+      Ok(subject) -> Ok(subject)
+      Error(_) -> Error("Failed to start Push-Sum actor " <> int.to_string(id))
+    }
+  })
+}
+
+fn setup_pushsum_supervisors(
+  actors: List(process.Subject(PushSumMessage)),
+  monitor: process.Subject(PushSumConvergenceMessage),
+) -> Nil {
+  list.each(actors, fn(actor) {
+    process.send(actor, SetPushSumSupervisor(monitor))
+  })
+  io.println(
+    "Set Push-Sum supervisor for all "
+    <> int.to_string(list.length(actors))
+    <> " actors",
+  )
+}
+
+fn setup_pushsum_neighbors(
+  actors: List(process.Subject(PushSumMessage)),
+  neighbor_map: Dict(Int, List(Int)),
+) -> Nil {
+  list.index_map(actors, fn(actor, index) {
+    case dict.get(neighbor_map, index) {
+      Ok(neighbor_indices) -> {
+        let neighbor_subjects =
+          list.filter_map(neighbor_indices, fn(neighbor_index) {
+            get_pushsum_actor_at_index(actors, neighbor_index)
+          })
+        process.send(actor, SetPushSumNeighbors(neighbor_subjects))
+      }
+      Error(_) -> {
+        io.println(
+          "Warning: No neighbors found for Push-Sum actor "
+          <> int.to_string(index),
+        )
+      }
+    }
+  })
+  Nil
+}
+
+fn get_pushsum_actor_at_index(
+  actors: List(process.Subject(PushSumMessage)),
+  index: Int,
+) -> Result(process.Subject(PushSumMessage), Nil) {
+  case index >= 0 {
+    True -> {
+      list.drop(actors, index)
+      |> list.first()
+    }
+    False -> Error(Nil)
+  }
+}
+
+fn initiate_pushsum(actors: List(process.Subject(PushSumMessage))) -> Nil {
+  case actors {
+    [] -> Nil
+    [first_actor, ..] -> {
+      io.println("Initiating Push-Sum protocol")
+      process.send(first_actor, PushSumPair(0.0, 0.0, -1))
     }
   }
 }
 
+fn wait_for_pushsum_convergence_with_monitor(
+  monitor: process.Subject(PushSumConvergenceMessage),
+  timeout_ms: Int,
+) -> Nil {
+  let start_time = get_current_time_ms()
+  monitor_pushsum_convergence_loop(monitor, start_time, timeout_ms, 3000)
+}
+
+fn monitor_pushsum_convergence_loop(
+  monitor: process.Subject(PushSumConvergenceMessage),
+  start_time: Int,
+  timeout_ms: Int,
+  check_interval: Int,
+) -> Nil {
+  let current_time = get_current_time_ms()
+
+  case current_time - start_time > timeout_ms {
+    True -> {
+      io.println(
+        "TIMEOUT: Push-Sum convergence monitoring stopped after "
+        <> int.to_string(timeout_ms)
+        <> "ms",
+      )
+      process.send(monitor, CheckPushSumConvergenceStatus)
+    }
+    False -> {
+      let result = process.call(monitor, 1000, GetPushSumConvergenceResult)
+      let PushSumConvergenceResult(converged: converged, ..) = result
+
+      case converged {
+        True -> {
+          io.println("Push-Sum convergence achieved. Exiting run loop.")
+          Nil
+        }
+        False -> {
+          process.send(monitor, CheckPushSumConvergenceStatus)
+          process.sleep(check_interval)
+          monitor_pushsum_convergence_loop(
+            monitor,
+            start_time,
+            timeout_ms,
+            check_interval,
+          )
+        }
+      }
+    }
+  }
+}
+
+fn print_final_pushsum_convergence_results(
+  monitor: process.Subject(PushSumConvergenceMessage),
+) -> Nil {
+  io.println("FINAL PUSH-SUM CONVERGENCE RESULTS:")
+  let result = process.call(monitor, 1000, GetPushSumConvergenceResult)
+  let PushSumConvergenceResult(
+    converged: c,
+    time_to_convergence: t,
+    convergence_percentage: cov,
+    converged_nodes: cn,
+    total_nodes: tn,
+    average_estimate: avg_est,
+    expected_average: exp_avg,
+  ) = result
+
+  io.println("   Converged: " <> bool_to_string(c))
+  io.println(
+    "   TOTAL CONVERGED NODES: "
+    <> int.to_string(cn)
+    <> " out of "
+    <> int.to_string(tn),
+  )
+  io.println(
+    "   Convergence percentage: " <> float.to_string(cov *. 100.0) <> "%",
+  )
+  io.println("   Expected average: " <> float.to_string(exp_avg))
+  io.println("   Actual average estimate: " <> float.to_string(avg_est))
+  io.println(
+    "   Final error: "
+    <> float.to_string(float.absolute_value(avg_est -. exp_avg)),
+  )
+  case t {
+    Some(ms) -> io.println("   Convergence time: " <> int.to_string(ms) <> "ms")
+    None -> io.println("   Convergence time: Unknown")
+  }
+}
+
+fn shutdown_pushsum_actors(actors: List(process.Subject(PushSumMessage))) -> Nil {
+  io.println("Shutting down all Push-Sum actors...")
+  list.each(actors, fn(actor) { process.send(actor, PushSumShutdown) })
+}
+
+// =============================================================================
+// COMMAND LINE PARSING
+// =============================================================================
+
 fn parse_command_args() -> Result(#(Int, Topology, Algorithm), String) {
-  case envoy.get("GLEAM_MAIN_ARGS") {
-    Ok(args_str) -> {
-      let args = string.split(args_str, " ")
-      case args {
-        [num_str, topology_str, algorithm_str] -> {
-          case int.parse(num_str) {
-            Ok(num_nodes) -> {
-              case parse_topology(topology_str) {
-                Ok(topology) -> {
-                  case parse_algorithm(algorithm_str) {
-                    Ok(algorithm) -> Ok(#(num_nodes, topology, algorithm))
-                    Error(e) -> Error(e)
-                  }
+  let args = argv.load().arguments
+
+  case args {
+    [num_str, topology_str, algorithm_str] -> {
+      case int.parse(num_str) {
+        Ok(num_nodes) -> {
+          case parse_topology(topology_str) {
+            Ok(topology) -> {
+              case parse_algorithm(algorithm_str) {
+                Ok(algorithm) -> {
+                  Ok(#(num_nodes, topology, algorithm))
                 }
                 Error(e) -> Error(e)
               }
             }
-            Error(_) -> Error("Invalid number of nodes: " <> num_str)
+            Error(e) -> Error(e)
           }
         }
-        _ -> Error("Expected 3 arguments: <numNodes> <topology> <algorithm>")
+        Error(_) -> Error("Invalid number of nodes: " <> num_str)
       }
     }
-    Error(_) -> {
+    _ -> {
       io.println("No command arguments found, using defaults for testing")
-      Ok(#(1000, Full, Gossip))
-      //Ok(#(1000, ThreeD, Gossip))
-      //Ok(#(100, Line, Gossip))
-      //Ok(#(1000, Imperfect3D, Gossip))
+      Ok(#(27, Imperfect3D, Gossip))
     }
   }
 }
@@ -970,8 +1821,28 @@ fn parse_algorithm(algorithm_str: String) -> Result(Algorithm, String) {
   }
 }
 
-fn run_pushsum_simulation(num_nodes: Int, topology: Topology) -> Nil {
-  io.println("Running Push-Sum simulation...")
-  // Implementation will go here
-  Nil
+// =============================================================================
+// MAIN ENTRY POINT
+// =============================================================================
+
+pub fn main() {
+  case parse_command_args() {
+    Ok(#(num_nodes, topology, algorithm)) -> {
+      io.println("Starting Enhanced Gossip Protocol Simulation")
+      io.println("Nodes: " <> int.to_string(num_nodes))
+      io.println("Topology: " <> topology_to_string(topology))
+      io.println("Algorithm: " <> algorithm_to_string(algorithm))
+
+      case algorithm {
+        Gossip -> run_gossip_simulation_with_monitor(num_nodes, topology)
+        PushSum -> run_pushsum_simulation_with_monitor(num_nodes, topology)
+      }
+    }
+    Error(msg) -> {
+      io.println("Error: " <> msg)
+      io.println("Usage: project2 <numNodes> <topology> <algorithm>")
+      io.println("Topology: full, 3D, line, imp3D")
+      io.println("Algorithm: gossip, push-sum")
+    }
+  }
 }
